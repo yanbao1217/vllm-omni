@@ -53,9 +53,31 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from vllm_omni.diffusion.layers.norm import RMSNorm as DiffusionRMSNorm
 
 logger = init_logger(__name__)
+
+
+class BooguImageMLLMRMSNorm(nn.Module):
+    """RMSNorm with the reference math (transformers ``Qwen3VLTextRMSNorm``).
+
+    Deliberately unfused: fp32 variance reduction, cast back to the input
+    dtype, then the weight multiply — matching the HF encoder the pipeline
+    replaced so hidden_states stay numerically comparable. The shared
+    ``vllm_omni`` RMSNorm dispatches to a fused CUDA kernel whose precision
+    path differs, which shows up directly in the final-norm hidden state.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
 
 
 @dataclass
@@ -216,8 +238,8 @@ class BooguImageMLLMAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
-        self.q_norm = DiffusionRMSNorm(self.head_dim, eps=text_config.rms_norm_eps)
-        self.k_norm = DiffusionRMSNorm(self.head_dim, eps=text_config.rms_norm_eps)
+        self.q_norm = BooguImageMLLMRMSNorm(self.head_dim, eps=text_config.rms_norm_eps)
+        self.k_norm = BooguImageMLLMRMSNorm(self.head_dim, eps=text_config.rms_norm_eps)
 
     def forward(
         self,
@@ -314,8 +336,8 @@ class BooguImageMLLMDecoderLayer(nn.Module):
             text_config, quant_config=quant_config, prefix=f"{prefix}.self_attn"
         )
         self.mlp = BooguImageMLLMMLP(text_config, quant_config=quant_config, prefix=f"{prefix}.mlp")
-        self.input_layernorm = DiffusionRMSNorm(text_config.hidden_size, eps=text_config.rms_norm_eps)
-        self.post_attention_layernorm = DiffusionRMSNorm(
+        self.input_layernorm = BooguImageMLLMRMSNorm(text_config.hidden_size, eps=text_config.rms_norm_eps)
+        self.post_attention_layernorm = BooguImageMLLMRMSNorm(
             text_config.hidden_size, eps=text_config.rms_norm_eps
         )
 
@@ -356,7 +378,7 @@ class BooguImageMLLMTextModel(nn.Module):
             )
             for i in range(text_config.num_hidden_layers)
         )
-        self.norm = DiffusionRMSNorm(text_config.hidden_size, eps=text_config.rms_norm_eps)
+        self.norm = BooguImageMLLMRMSNorm(text_config.hidden_size, eps=text_config.rms_norm_eps)
         self.rotary_emb = Qwen3VLTextRotaryEmbedding(text_config)
 
     @staticmethod
