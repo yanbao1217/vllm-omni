@@ -139,7 +139,7 @@ Boogu-Image supports the following FP8 loading paths:
 | Path | Checkpoints | MLLM | DiT |
 | --- | --- | --- | --- |
 | Pre-quantized FP8 | `Boogu/Boogu-Image-0.1-{Base,Edit}-fp8` | HF checkpoint FP8 configuration | TorchAO FP8 weight-only (W8A16) |
-| Online FP8 | `Boogu/Boogu-Image-0.1-{Base,Edit}` | Optional HF block FP8 (W8A8) | Native dynamic FP8 (W8A8) |
+| Online FP8 | `Boogu/Boogu-Image-0.1-{Base,Edit}` | Native dynamic FP8 (W8A8) | Native dynamic FP8 (W8A8) |
 
 #### Environment
 
@@ -208,7 +208,7 @@ quantization configuration.
       512x512 and 23.6-24.5 GiB at 1024x1024.
 
 - **Quantization scope:** For original Base/Edit checkpoints, `--quantization fp8`
-  quantizes the MLLM's language-model linear layers through HF block FP8
+  quantizes the MLLM's language-model linear layers through the same native vLLM online FP8 path as the DiT
   and the DiT's linear layers through native online FP8. The vision encoder,
   embeddings, normalization layers and VAE remain unquantized.
 
