@@ -80,6 +80,11 @@ def mock_dependencies(mocker, monkeypatch):
     mock_transformer_cls.return_value = mock_transformer_instance
     monkeypatch.setattr(f"{_MODULE}.BooguImageTransformer2DModel", mock_transformer_cls)
 
+    # Native branch: the encoder class itself is mocked (weights stream
+    # through weights_sources / AutoWeightsLoader in real runs).
+    mllm_cls = mocker.patch(f"{_MODULE}.BooguImageMLLM", name="boogu_mllm_cls")
+    mllm_cls.return_value.dtype = torch.float32
+
     # Treat only the dummy model id as local. Other filesystem checks (for
     # example lazy imports in the quantization registry) must remain real.
     path_exists = os.path.exists
@@ -90,6 +95,7 @@ def mock_dependencies(mocker, monkeypatch):
         "mllm_wrapper": mllm_wrapper,
         "mllm_loader": mllm_loader,
         "mllm_config_loader": mllm_config_loader,
+        "mllm_cls": mllm_cls,
         "processor": mock_processor,
         "vae": mock_vae,
         "scheduler": mock_scheduler,
@@ -138,13 +144,12 @@ def test_constructor_wires_components(boogu_pipeline, mock_dependencies):
     assert boogu_pipeline.vae_scale_factor == 8
     assert boogu_pipeline.default_sample_size == 128
     assert hasattr(boogu_pipeline, "load_weights")
-    assert mock_dependencies["mllm_loader"].call_args.kwargs["quantization_config"] is None
-    mock_dependencies["mllm_config_loader"].assert_not_called()
-
-
-def test_constructor_strips_mllm_lm_head(boogu_pipeline, mock_dependencies):
-    # Upstream encodes with the inner Qwen3VLModel, not the generation wrapper.
-    assert boogu_pipeline.mllm is mock_dependencies["inner_encoder"]
+    # BF16 checkpoint -> native encoder branch, no quantization requested.
+    assert boogu_pipeline.mllm is mock_dependencies["mllm_cls"].return_value
+    assert mock_dependencies["mllm_cls"].call_args.kwargs["quant_config"] is None
+    assert mock_dependencies["mllm_cls"].call_args.kwargs["prefix"] == "mllm"
+    mock_dependencies["mllm_loader"].assert_not_called()
+    assert mock_dependencies["mllm_config_loader"].call_count == 1
 
 
 def test_constructor_forwards_revision_to_all_component_loaders(mock_dependencies, mocker):
@@ -180,24 +185,33 @@ def test_constructor_forwards_revision_to_all_component_loaders(mock_dependencie
 
     pipeline = BooguImagePipeline(od_config=od_config)
 
-    (source,) = pipeline.weights_sources
-    assert source.revision == revision
+    transformer_source, mllm_source = pipeline.weights_sources
+    assert transformer_source.revision == revision
+    assert mllm_source.revision == revision
     prefetch.assert_called_once_with(
         "dummy-boogu",
         ["scheduler", "vae", "mllm", "processor"],
         local_files_only=True,
         revision=revision,
     )
-    for loader in (scheduler_loader, mllm_loader, processor_loader, vae_loader):
+    # Native branch: revision flows through the config read, the weight
+    # source and the remaining from_pretrained loaders.
+    assert mock_dependencies["mllm_config_loader"].call_args.kwargs["revision"] == revision
+    for loader in (scheduler_loader, processor_loader, vae_loader):
         assert loader.call_args.kwargs["revision"] == revision
+    mllm_loader.assert_not_called()
 
 
 def test_constructor_weights_sources(boogu_pipeline):
-    (source,) = boogu_pipeline.weights_sources
-    assert source.model_or_path == "dummy-boogu"
-    assert source.subfolder == "transformer"
-    assert source.prefix == "transformer."
-    assert source.fall_back_to_pt is True
+    transformer_source, mllm_source = boogu_pipeline.weights_sources
+    assert transformer_source.model_or_path == "dummy-boogu"
+    assert transformer_source.subfolder == "transformer"
+    assert transformer_source.prefix == "transformer."
+    assert transformer_source.fall_back_to_pt is True
+    assert mllm_source.model_or_path == "dummy-boogu"
+    assert mllm_source.subfolder == "mllm"
+    assert mllm_source.prefix == "mllm."
+    assert mllm_source.fall_back_to_pt is False
 
 
 def test_constructor_rejects_unsupported_mllm_quantization(mock_dependencies, mocker):
@@ -218,8 +232,9 @@ def test_constructor_rejects_unsupported_mllm_quantization(mock_dependencies, mo
     )
     with pytest.raises(ValueError, match="Boogu MLLM only supports FP8 quantization"):
         BooguImagePipeline(od_config=od_config)
+    # Validation fires after the config read but before any model branch.
     mock_dependencies["mllm_loader"].assert_not_called()
-    mock_dependencies["mllm_config_loader"].assert_not_called()
+    mock_dependencies["mllm_cls"].assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -229,8 +244,7 @@ def test_constructor_rejects_unsupported_mllm_quantization(mock_dependencies, mo
         pytest.param({"mllm": None, "transformer": "fp8"}, False, id="dit-only-fp8"),
     ],
 )
-def test_constructor_routes_mllm_hf_quantization(mock_dependencies, quantization_config, quantize_mllm):
-    from transformers import FineGrainedFP8Config
+def test_constructor_routes_mllm_native_quantization(mock_dependencies, quantization_config, quantize_mllm):
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
     from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguImagePipeline
@@ -243,32 +257,51 @@ def test_constructor_routes_mllm_hf_quantization(mock_dependencies, quantization
     )
     BooguImagePipeline(od_config=od_config)
 
-    hf_quant_config = mock_dependencies["mllm_loader"].call_args.kwargs["quantization_config"]
+    native_quant = mock_dependencies["mllm_cls"].call_args.kwargs["quant_config"]
     if quantize_mllm:
-        assert isinstance(hf_quant_config, FineGrainedFP8Config)
-        assert hf_quant_config.activation_scheme == "dynamic"
-        assert hf_quant_config.modules_to_not_convert == ["lm_head", "model.visual"]
+        assert isinstance(native_quant, Fp8Config)
+        # A private copy carries the packed mapping; the shared instance is untouched.
+        assert native_quant.packed_modules_mapping != {}
     else:
-        assert hf_quant_config is None
-        mock_dependencies["mllm_config_loader"].assert_not_called()
+        assert native_quant is None
     assert isinstance(mock_dependencies["transformer_cls"].call_args.kwargs["quant_config"], Fp8Config)
+    mock_dependencies["mllm_loader"].assert_not_called()
 
 
-def test_mllm_hf_quantization_maps_only_mllm_ignored_layers(mock_dependencies):
+def test_resolve_mllm_quant_config_isolation_and_packed_mapping(mock_dependencies):
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
-    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import _get_mllm_hf_quantization_config
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import _resolve_mllm_quant_config
 
     quant_config = Fp8Config(
         ignored_layers=["mllm.language_model.layers.0.self_attn.q_proj", "transformer.blocks.0.attn.to_q"]
     )
-    hf_quant_config = _get_mllm_hf_quantization_config(quant_config, "dummy-boogu", True)
+    routed = _resolve_mllm_quant_config(quant_config)
 
-    assert hf_quant_config.modules_to_not_convert == [
-        "lm_head",
-        "model.visual",
-        "model.language_model.layers.0.self_attn.q_proj",
+    # Zero-rewrite routing: pipeline-level prefixes flow through unchanged;
+    # only the fused-module mapping is attached, on a private copy.
+    assert routed is not quant_config
+    assert routed.ignored_layers == [
+        "mllm.language_model.layers.0.self_attn.q_proj",
+        "transformer.blocks.0.attn.to_q",
     ]
+    assert routed.packed_modules_mapping == {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+    assert quant_config.packed_modules_mapping == {}
+    assert _resolve_mllm_quant_config(None) is None
+    with pytest.raises(ValueError, match="Boogu MLLM only supports FP8 quantization"):
+        _resolve_mllm_quant_config(_mock_quant())
+
+
+def _mock_quant():
+    from unittest.mock import MagicMock
+
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+    return MagicMock(spec=QuantizationConfig)
 
 
 def test_constructor_preserves_serialized_mllm_quantization(mock_dependencies):
@@ -283,10 +316,41 @@ def test_constructor_preserves_serialized_mllm_quantization(mock_dependencies):
         dtype=torch.bfloat16,
         quantization_config="fp8",
     )
-    BooguImagePipeline(od_config=od_config)
+    pipeline = BooguImagePipeline(od_config=od_config)
 
-    # No override: HF reads the serialized checkpoint's scales and skip list.
+    # Checkpoint wins: HF reads the serialized scales and skip list, the
+    # explicit user mllm config is ignored, and the native encoder is not
+    # constructed. lm_head is stripped, keeping the inner Qwen3VLModel.
     assert mock_dependencies["mllm_loader"].call_args.kwargs["quantization_config"] is None
+    mock_dependencies["mllm_cls"].assert_not_called()
+    assert pipeline.mllm is mock_dependencies["inner_encoder"]
+    # No mllm weight source on the HF branch.
+    assert [source.subfolder for source in pipeline.weights_sources] == ["transformer"]
+
+
+def test_constructor_serialized_checkpoint_still_rejects_non_fp8(mock_dependencies, mocker):
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+    from vllm_omni.diffusion.models.boogu_image.pipeline_boogu_image import BooguImagePipeline
+    from vllm_omni.quantization.component_config import ComponentQuantizationConfig
+
+    mock_dependencies["mllm_config_loader"].return_value = Qwen3VLConfig(
+        quantization_config={"quant_method": "fp8", "modules_to_not_convert": ["model.visual"]}
+    )
+    encoder_config = mocker.MagicMock(spec=QuantizationConfig)
+    od_config = OmniDiffusionConfig(
+        model="dummy-boogu-fp8",
+        tf_model_config=TransformerConfig(params={}),
+        dtype=torch.bfloat16,
+        quantization_config=ComponentQuantizationConfig(
+            {"transformer": "fp8", "mllm": encoder_config, "vae": None}
+        ),
+    )
+    # Ordering locked: the non-FP8 rejection fires before the HF branch runs.
+    with pytest.raises(ValueError, match="Boogu MLLM only supports FP8 quantization"):
+        BooguImagePipeline(od_config=od_config)
+    mock_dependencies["mllm_loader"].assert_not_called()
+    mock_dependencies["mllm_cls"].assert_not_called()
 
 
 @pytest.mark.parametrize(

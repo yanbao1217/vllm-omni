@@ -20,6 +20,7 @@ Ported from the upstream ``boogu`` package
   ``BooguImageTurboPipeline`` selects the upstream few-step DMD student path.
 """
 
+import copy
 import json
 import os
 from collections.abc import Iterable
@@ -34,8 +35,7 @@ from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from transformers import FineGrainedFP8Config, Qwen3VLConfig, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
-from transformers.utils.quantization_config import QuantizationConfigMixin
+from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
@@ -52,6 +52,7 @@ from vllm_omni.diffusion.models.boogu_image.boogu_image_transformer import (
     RotaryFrequencyTables,
 )
 from vllm_omni.diffusion.models.boogu_image.image_processor import BooguImageProcessor
+from vllm_omni.diffusion.models.boogu_image.mllm import BooguImageMLLM
 from vllm_omni.diffusion.models.boogu_image.scheduling_flow_match_euler_discrete_time_shifting import (
     FlowMatchEulerDiscreteScheduler,
 )
@@ -73,36 +74,39 @@ _MAX_INPUT_IMAGE_PIXELS = 2048 * 2048
 _MAX_INPUT_IMAGE_SIDE_LENGTH = 2048 * 2
 
 
-def _get_mllm_hf_quantization_config(
-    quant_config: QuantizationConfig | None,
-    model_path: str,
-    local_files_only: bool,
-    revision: str | None = None,
-) -> QuantizationConfigMixin | None:
-    """Build an HF quantization override while preserving checkpoint quantization.
-    Replace with native vLLM quantization once a dedicated encoder is available.
+_MLLM_PACKED_MODULES_MAPPING: dict[str, list[str]] = {
+    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+    "gate_up_proj": ["gate_proj", "up_proj"],
+}
+
+
+def _is_serialized_fp8_checkpoint(mllm_config: Qwen3VLConfig) -> bool:
+    """True when the checkpoint's ``mllm/config.json`` declares FP8 weights."""
+    ckpt_quant = getattr(mllm_config, "quantization_config", None)
+    return bool(ckpt_quant) and ckpt_quant.get("quant_method") == "fp8"
+
+
+def _resolve_mllm_quant_config(
+    user_quant_config: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    """Route the mllm component quant config onto the native encoder.
+
+    ``Fp8Config`` (online) flows into the encoder's vLLM parallel linears.
+    The returned copy carries the fused-module mapping so ``ignored_layers``
+    entries written against pipeline prefixes (e.g.
+    ``mllm.language_model.layers.0.self_attn.q_proj``) resolve through vLLM's
+    ``is_layer_skipped`` without manual rewriting; a copy avoids polluting a
+    config instance shared with the transformer under ``--quantization fp8``.
+    Note vLLM fused linears require whole-set skip granularity (q+k+v, not q
+    alone) — unlike the previous HF channel, which could skip single shards.
     """
-    if quant_config is None:
+    if user_quant_config is None:
         return None
-
-    if not isinstance(quant_config, Fp8Config):
+    if not isinstance(user_quant_config, Fp8Config):
         raise ValueError("Boogu MLLM only supports FP8 quantization. Set mllm to null to disable online quantization.")
-
-    config = Qwen3VLConfig.from_pretrained(
-        model_path, subfolder="mllm", local_files_only=local_files_only, revision=revision
-    )
-    # Let HF use the checkpoint's quantization settings, including its skip list.
-    if getattr(config, "quantization_config", None):
-        return None
-
-    modules_to_not_convert = ["lm_head", "model.visual"]
-    for layer_name in quant_config.ignored_layers:
-        if layer_name.startswith("mllm."):
-            modules_to_not_convert.append(layer_name.replace("mllm.", "model.", 1))
-    return FineGrainedFP8Config(
-        activation_scheme="dynamic",
-        modules_to_not_convert=modules_to_not_convert,
-    )
+    routed = copy.deepcopy(user_quant_config)
+    routed.packed_modules_mapping = dict(_MLLM_PACKED_MODULES_MAPPING)
+    return routed
 
 
 def _load_vae_scale_factor(model_path: str) -> int:
@@ -279,6 +283,16 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
         self._raise_unsupported_features()
         transformer_quant_config = resolve_component_quant_config(od_config.quantization_config, "transformer")
         mllm_quant_config = resolve_component_quant_config(od_config.quantization_config, "mllm")
+
+        self._execution_device = get_local_device()
+        model = od_config.model
+        local_files_only = os.path.exists(model)
+
+        mllm_config = Qwen3VLConfig.from_pretrained(
+            model, subfolder="mllm", local_files_only=local_files_only, revision=od_config.revision
+        )
+        mllm_is_serialized_fp8 = _is_serialized_fp8_checkpoint(mllm_config)
+
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=od_config.model,
@@ -288,10 +302,20 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
                 fall_back_to_pt=True,
             )
         ]
-
-        self._execution_device = get_local_device()
-        model = od_config.model
-        local_files_only = os.path.exists(model)
+        if not mllm_is_serialized_fp8:
+            # Native branch: mllm weights stream through the shared loader
+            # (AutoWeightsLoader hands the "mllm." group to the encoder's
+            # own load_weights), and online FP8 processing follows the same
+            # shared path as the DiT.
+            self.weights_sources.append(
+                DiffusersPipelineLoader.ComponentSource(
+                    model_or_path=od_config.model,
+                    subfolder="mllm",
+                    revision=od_config.revision,
+                    prefix="mllm.",
+                    fall_back_to_pt=False,
+                )
+            )
 
         # See ``hub_prefetch.py`` for the transformers v5 multi-worker subfolder
         # race; prefetch the whole component set before any from_pretrained.
@@ -309,28 +333,40 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
             local_files_only=local_files_only,
             revision=od_config.revision,
         )
-        mllm_hf_quant_config = _get_mllm_hf_quantization_config(
-            quant_config=mllm_quant_config,
-            model_path=model,
-            local_files_only=local_files_only,
-            revision=od_config.revision,
-        )
-        mllm = from_pretrained_with_prefetch(
-            Qwen3VLForConditionalGeneration.from_pretrained,
-            model,
-            subfolder="mllm",
-            prefetch_list=boogu_subfolders,
-            local_files_only=local_files_only,
-            torch_dtype=od_config.dtype,
-            revision=od_config.revision,
-            quantization_config=mllm_hf_quant_config,
-        )
-        # Upstream reuses the full VLM as an optional instruction rewriter and
-        # encodes with its inner model (no ``lm_head``); the rewriter is not
-        # ported, so keep only the inner ``Qwen3VLModel`` as the encoder.
-        if hasattr(mllm, "lm_head"):
-            mllm = mllm.model
-        self.mllm = mllm.to(self._execution_device)
+        if mllm_is_serialized_fp8:
+            # Serialised -fp8 checkpoints keep the HF loading path: HF consumes
+            # the checkpoint-declared quantization (checkpoint wins — an
+            # explicit user mllm quant config is ignored for this component,
+            # matching the pre-native behaviour).
+            if mllm_quant_config is not None and not isinstance(mllm_quant_config, Fp8Config):
+                raise ValueError(
+                    "Boogu MLLM only supports FP8 quantization. Set mllm to null to disable online quantization."
+                )
+            mllm = from_pretrained_with_prefetch(
+                Qwen3VLForConditionalGeneration.from_pretrained,
+                model,
+                subfolder="mllm",
+                prefetch_list=boogu_subfolders,
+                local_files_only=local_files_only,
+                torch_dtype=od_config.dtype,
+                revision=od_config.revision,
+                quantization_config=None,
+            )
+            # Upstream reuses the full VLM as an optional instruction rewriter
+            # and encodes with its inner model (no ``lm_head``); the rewriter
+            # is not ported, so keep only the inner ``Qwen3VLModel``.
+            if hasattr(mllm, "lm_head"):
+                mllm = mllm.model
+            self.mllm = mllm.to(self._execution_device)
+        else:
+            # Native branch: the encoder's linears live under vLLM quantization
+            # (Fp8Config online); dtype/device follow the loader context, same
+            # as the DiT transformer below.
+            self.mllm = BooguImageMLLM(
+                mllm_config,
+                quant_config=_resolve_mllm_quant_config(mllm_quant_config),
+                prefix="mllm",
+            )
 
         self.processor = Qwen3VLProcessor.from_pretrained(
             model,
